@@ -33,15 +33,12 @@ dp = Dispatcher()
 # =============================================================================
 # FIX #1: PERSISTENT DATABASE CLIENT (Connection Pooling)
 # =============================================================================
-# Instead of opening/closing a connection per query, we keep one client alive.
-db_client = None
+# Create client at module level so it's always ready — no startup timing issues.
+db_client = libsql_client.create_client(TURSO_URL, auth_token=TURSO_TOKEN)
 
 
 async def init_db():
-    """Create the persistent DB client and ensure tables exist."""
-    global db_client
-    db_client = libsql_client.create_client(TURSO_URL, auth_token=TURSO_TOKEN)
-
+    """Ensure tables exist and run migrations."""
     # Create / migrate tables
     await db_client.batch([
         # Main users table with all new columns
@@ -692,17 +689,36 @@ async def cleanup_idle_chats():
 # =============================================================================
 
 async def on_startup(**kwargs):
-    # Initialize DB and cache
-    await init_db()
-    await load_cache_from_db()
+    try:
+        # Initialize DB tables and load cache
+        await init_db()
+        logging.info("Database initialized successfully.")
+        await load_cache_from_db()
+        logging.info("Cache loaded from DB.")
 
-    # Start background idle-cleanup task
-    asyncio.create_task(cleanup_idle_chats())
+        # Start background idle-cleanup task
+        asyncio.create_task(cleanup_idle_chats())
 
-    # Set webhook
-    webhook_url = f"{RENDER_APP_URL}{WEBHOOK_PATH}"
-    await bot.set_webhook(webhook_url)
-    logging.info(f"Webhook set to {webhook_url}")
+        # Set webhook
+        webhook_url = f"{RENDER_APP_URL}{WEBHOOK_PATH}"
+        await bot.set_webhook(webhook_url)
+        logging.info(f"Webhook set to {webhook_url}")
+    except Exception as e:
+        logging.error(f"Startup error: {e}", exc_info=True)
+        raise
+
+
+async def on_shutdown(**kwargs):
+    """Clean up sessions on shutdown to avoid 'Unclosed client session' warnings."""
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+    try:
+        await db_client.close()
+    except Exception:
+        pass
+    logging.info("Bot shut down cleanly.")
 
 
 async def ping_handler(request: web.Request):
@@ -711,6 +727,7 @@ async def ping_handler(request: web.Request):
 
 def main():
     dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     app = web.Application()
 
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
