@@ -718,15 +718,10 @@ async def on_startup(**kwargs):
 
 
 async def on_shutdown(**kwargs):
-    """Clean up sessions on shutdown to avoid 'Unclosed client session' warnings."""
-    global db_client
-    if db_client is not None:
-        try:
-            await db_client.close()
-            db_client = None
-        except Exception:
-            pass
-    logging.info("Bot shut down cleanly.")
+    """Log shutdown. Don't close db_client here — Render does internal restart
+    cycles where on_shutdown fires but on_startup doesn't re-fire, which would
+    leave db_client as None and break the bot."""
+    logging.info("Bot shutting down.")
 
 
 async def ping_handler(request: web.Request):
