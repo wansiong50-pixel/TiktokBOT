@@ -691,7 +691,7 @@ async def cleanup_idle_chats():
 # RENDER WEBHOOK & SERVER SETUP
 # =============================================================================
 
-async def on_startup(bot_instance: Bot):
+async def on_startup(**kwargs):
     # Initialize DB and cache
     await init_db()
     await load_cache_from_db()
@@ -701,7 +701,7 @@ async def on_startup(bot_instance: Bot):
 
     # Set webhook
     webhook_url = f"{RENDER_APP_URL}{WEBHOOK_PATH}"
-    await bot_instance.set_webhook(webhook_url)
+    await bot.set_webhook(webhook_url)
     logging.info(f"Webhook set to {webhook_url}")
 
 
