@@ -41,6 +41,12 @@ db_client = None
 async def init_db():
     """Create the persistent DB client and ensure tables exist."""
     global db_client
+    # Close old client if restarting (prevents 'Unclosed client session')
+    if db_client is not None:
+        try:
+            await db_client.close()
+        except Exception:
+            pass
     db_client = libsql_client.create_client(TURSO_URL, auth_token=TURSO_TOKEN)
     # Create / migrate tables
     await db_client.batch([
@@ -713,14 +719,13 @@ async def on_startup(**kwargs):
 
 async def on_shutdown(**kwargs):
     """Clean up sessions on shutdown to avoid 'Unclosed client session' warnings."""
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
-    try:
-        await db_client.close()
-    except Exception:
-        pass
+    global db_client
+    if db_client is not None:
+        try:
+            await db_client.close()
+            db_client = None
+        except Exception:
+            pass
     logging.info("Bot shut down cleanly.")
 
 
