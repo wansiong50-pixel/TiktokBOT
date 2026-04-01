@@ -33,12 +33,15 @@ dp = Dispatcher()
 # =============================================================================
 # FIX #1: PERSISTENT DATABASE CLIENT (Connection Pooling)
 # =============================================================================
-# Create client at module level so it's always ready — no startup timing issues.
-db_client = libsql_client.create_client(TURSO_URL, auth_token=TURSO_TOKEN)
+# Client must be created inside an async function (needs event loop).
+# Once created, it's reused for all queries.
+db_client = None
 
 
 async def init_db():
-    """Ensure tables exist and run migrations."""
+    """Create the persistent DB client and ensure tables exist."""
+    global db_client
+    db_client = libsql_client.create_client(TURSO_URL, auth_token=TURSO_TOKEN)
     # Create / migrate tables
     await db_client.batch([
         # Main users table with all new columns
