@@ -168,13 +168,11 @@ async def cmd_start(message: types.Message):
         "Find a partner instantly and chat anonymously.\n\n"
         "📌 <b>Commands:</b>\n"
         "• /search — Find a random partner\n"
-        "• /search <i>topic</i> — Find someone interested in the same topic\n"
         "• /next — Skip to a new partner\n"
         "• /end — End the current chat\n"
         "• /block — Report a spammer\n"
         "• /profile — View your stats\n"
-        "• /setgender <i>male/female</i> — Set your gender\n"
-        "• /prefer <i>male/female/any</i> — Set partner preference\n\n"
+        "\n"
         "⚠️ <i>Rules:</i> No images allowed. Only tiktok.com links will go through.\n\n"
         f"☕ <i>Support the Bot:</i> {DONATION_LINK}"
     )
@@ -182,37 +180,27 @@ async def cmd_start(message: types.Message):
 
 
 # =============================================================================
-# FIX #14: GENDER / PREFERENCE
+# PREFERENCE COMMANDS TEMPORARILY DISABLED
 # =============================================================================
 
 @dp.message(Command("setgender"))
 async def cmd_setgender(message: types.Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or parts[1].strip().lower() not in ("male", "female"):
-        await message.answer("⚠️ Usage: /setgender <b>male</b> or <b>female</b>", parse_mode="HTML")
-        return
-
-    gender = parts[1].strip().lower()
-    await execute_db("UPDATE users SET gender = ? WHERE user_id = ?", [gender, message.from_user.id])
-    emoji = "👨" if gender == "male" else "👩"
-    await message.answer(f"{emoji} Gender set to <b>{gender}</b>.", parse_mode="HTML")
+    await message.answer(
+        "Preferences are temporarily disabled to help everyone find matches faster. "
+        "Just use /search and the bot will connect you with any available partner."
+    )
 
 
 @dp.message(Command("prefer"))
 async def cmd_prefer(message: types.Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or parts[1].strip().lower() not in ("male", "female", "any"):
-        await message.answer("⚠️ Usage: /prefer <b>male</b>, <b>female</b>, or <b>any</b>", parse_mode="HTML")
-        return
-
-    pref = parts[1].strip().lower()
-    value = None if pref == "any" else pref
-    await execute_db("UPDATE users SET prefer_gender = ? WHERE user_id = ?", [value, message.from_user.id])
-    await message.answer(f"✅ Partner preference set to <b>{pref}</b>.", parse_mode="HTML")
+    await message.answer(
+        "Preferences are temporarily disabled to help everyone find matches faster. "
+        "Just use /search and the bot will connect you with any available partner."
+    )
 
 
 # =============================================================================
-# FIX #7: INTEREST-BASED MATCHING + FIX #3: RACE CONDITION LOCK
+# FIX #3: RACE CONDITION LOCK
 # FIX #10: ONLINE COUNT & QUEUE POSITION
 # =============================================================================
 
@@ -225,68 +213,24 @@ async def cmd_search(message: types.Message):
         await message.answer("You are already in a chat! Type /next to skip them or /end to stop.")
         return
 
-    # Parse optional interest
-    parts = message.text.split(maxsplit=1)
-    interest = parts[1].strip().lower() if len(parts) > 1 else None
+    # Clear legacy preference data and only match on availability + trust tier.
+    await execute_db("UPDATE users SET interest = NULL WHERE user_id = ?", [user_id])
 
-    # Save interest to DB
-    await execute_db("UPDATE users SET interest = ? WHERE user_id = ?", [interest, user_id])
-
-    # Get user's own trust tier, gender, preference
+    # Get the user's trust tier.
     user_data = await execute_db(
-        "SELECT trust_tier, gender, prefer_gender FROM users WHERE user_id = ?", [user_id]
+        "SELECT trust_tier FROM users WHERE user_id = ?", [user_id]
     )
     if not user_data.rows:
         return
 
     trust_tier = user_data.rows[0][0]
-    user_gender = user_data.rows[0][1]
-    user_pref = user_data.rows[0][2]
 
     # FIX #3: Lock to prevent race conditions in matching
     async with search_lock:
-        # Build the matching query dynamically
-        # Same trust tier, searching status, not self
-        conditions = ["status = 'searching'", "trust_tier = ?", "user_id != ?"]
-        params = [trust_tier, user_id]
-
-        # Interest matching: if user set an interest, prefer same interest
-        if interest:
-            conditions.append("interest = ?")
-            params.append(interest)
-
-        # Gender preference matching
-        # If user prefers a gender, filter for partners of that gender
-        if user_pref:
-            conditions.append("gender = ?")
-            params.append(user_pref)
-
-        # If user has a gender, exclude partners who prefer a different gender
-        if user_gender:
-            conditions.append("(prefer_gender IS NULL OR prefer_gender = ?)")
-            params.append(user_gender)
-
-        where_clause = " AND ".join(conditions)
         partner_search = await execute_db(
-            f"SELECT user_id FROM users WHERE {where_clause} LIMIT 1",
-            params
+            "SELECT user_id FROM users WHERE status = 'searching' AND trust_tier = ? AND user_id != ? LIMIT 1",
+            [trust_tier, user_id]
         )
-
-        # If no exact match found and interest was set, fall back to any interest
-        if not partner_search.rows and interest:
-            conditions_fallback = ["status = 'searching'", "trust_tier = ?", "user_id != ?"]
-            params_fallback = [trust_tier, user_id]
-            if user_pref:
-                conditions_fallback.append("gender = ?")
-                params_fallback.append(user_pref)
-            if user_gender:
-                conditions_fallback.append("(prefer_gender IS NULL OR prefer_gender = ?)")
-                params_fallback.append(user_gender)
-            where_fallback = " AND ".join(conditions_fallback)
-            partner_search = await execute_db(
-                f"SELECT user_id FROM users WHERE {where_fallback} LIMIT 1",
-                params_fallback
-            )
 
         if partner_search.rows:
             partner_id = partner_search.rows[0][0]
@@ -300,19 +244,21 @@ async def cmd_search(message: types.Message):
             # FIX #2: Update in-memory cache
             cache_pair(user_id, partner_id)
 
-            topic_msg = f" (Topic: <i>{interest}</i>)" if interest else ""
             await message.answer(
-                f"🤝 <b>Partner found!</b>{topic_msg} Say hi and drop your TikTok link.",
+                "🤝 <b>Partner found!</b> Say hi and drop your TikTok link.",
                 parse_mode="HTML"
             )
             await bot.send_message(
                 partner_id,
-                f"🤝 <b>Partner found!</b>{topic_msg} Say hi and drop your TikTok link.",
+                "🤝 <b>Partner found!</b> Say hi and drop your TikTok link.",
                 parse_mode="HTML"
             )
         else:
             # No partner found — enter the queue
-            await execute_db("UPDATE users SET status = 'searching' WHERE user_id = ?", [user_id])
+            await execute_db(
+                "UPDATE users SET status = 'searching', interest = NULL WHERE user_id = ?",
+                [user_id]
+            )
             user_status_cache[user_id] = 'searching'
 
             # FIX #10: Show queue position and online count
@@ -326,9 +272,8 @@ async def cmd_search(message: types.Message):
             queue_pos = queue_data.rows[0][0]
             online_count = online_data.rows[0][0]
 
-            topic_note = f" for <i>{interest}</i>" if interest else ""
             await message.answer(
-                f"🔍 Searching{topic_note}...\n"
+                "🔍 Searching...\n"
                 f"📊 You are <b>#{queue_pos}</b> in queue · <b>{online_count}</b> users online",
                 parse_mode="HTML"
             )
@@ -469,7 +414,7 @@ async def cmd_profile(message: types.Message):
     user_id = message.from_user.id
     data = await execute_db(
         "SELECT trust_tier, chats_completed, positive_ratings, negative_ratings, "
-        "block_count, gender, prefer_gender, created_at FROM users WHERE user_id = ?",
+        "block_count, created_at FROM users WHERE user_id = ?",
         [user_id]
     )
 
@@ -483,9 +428,7 @@ async def cmd_profile(message: types.Message):
     pos_ratings = row[2] or 0
     neg_ratings = row[3] or 0
     blocks = row[4] or 0
-    gender = row[5] or "Not set"
-    pref = row[6] or "Any"
-    created_at = row[7] or "Unknown"
+    created_at = row[5] or "Unknown"
 
     # Trust tier emoji
     tier_display = {
@@ -507,8 +450,7 @@ async def cmd_profile(message: types.Message):
         f"💬 Chats completed: {chats}\n"
         f"⭐ Rating: {rating_display}\n"
         f"🚫 Times reported: {blocks}\n"
-        f"👤 Gender: {gender.capitalize()}\n"
-        f"💕 Preference: {pref.capitalize()}\n"
+        "🎯 Matching preferences: Disabled for now\n"
         f"📅 Member since: {created_at}",
         parse_mode="HTML"
     )
