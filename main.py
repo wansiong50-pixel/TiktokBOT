@@ -26,6 +26,7 @@ RATE_LIMIT_MESSAGES = 5       # Max messages allowed in the time window
 RATE_LIMIT_WINDOW = 3         # Seconds for rate limit window
 IDLE_TIMEOUT = 300            # Auto-disconnect after 5 minutes of inactivity
 IDLE_CHECK_INTERVAL = 60      # Check for idle users every 60 seconds
+MATCHMAKER_INTERVAL = 5       # Try pairing queued users every 5 seconds
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -64,6 +65,11 @@ async def init_db():
             positive_ratings INTEGER DEFAULT 0,
             negative_ratings INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
         )""",
     ])
 
@@ -137,8 +143,51 @@ def cache_unpair(user_id: int):
     return partner_id
 
 
+async def connect_users(user_id: int, partner_id: int):
+    """Persist and cache a pair, then notify both users."""
+    await batch_db([
+        ("UPDATE users SET status = 'chatting', partner_id = ? WHERE user_id = ?", [partner_id, user_id]),
+        ("UPDATE users SET status = 'chatting', partner_id = ? WHERE user_id = ?", [user_id, partner_id]),
+    ])
+    cache_pair(user_id, partner_id)
+
+    try:
+        await bot.send_message(
+            user_id,
+            "🤝 <b>Partner found!</b> Say hi and drop your TikTok link.",
+            parse_mode="HTML"
+        )
+        await bot.send_message(
+            partner_id,
+            "🤝 <b>Partner found!</b> Say hi and drop your TikTok link.",
+            parse_mode="HTML"
+        )
+        return True
+    except Exception as e:
+        logging.warning(f"Match notification failed for {user_id} and {partner_id}: {e}")
+        cache_unpair(user_id)
+        await batch_db([
+            ("UPDATE users SET status = 'idle', partner_id = NULL WHERE user_id = ?", [user_id]),
+            ("UPDATE users SET status = 'idle', partner_id = NULL WHERE user_id = ?", [partner_id]),
+        ])
+
+        for target_id in (user_id, partner_id):
+            try:
+                await bot.send_message(
+                    target_id,
+                    "We found a partner, but the connection failed. Type /search to try again."
+                )
+            except Exception:
+                pass
+
+        return False
+
+
 async def load_cache_from_db():
     """On startup, reload active pairs from DB into memory."""
+    active_pairs.clear()
+    user_status_cache.clear()
+    last_activity.clear()
     result = await execute_db("SELECT user_id, status, partner_id FROM users WHERE status IN ('chatting', 'searching')")
     for row in result.rows:
         uid, status, pid = row[0], row[1], row[2]
@@ -146,6 +195,59 @@ async def load_cache_from_db():
         if status == 'chatting' and pid:
             active_pairs[uid] = pid
             last_activity[uid] = time.time()
+
+
+async def reset_search_queue_once():
+    """Clear stale queued users one time after deploying the simpler matcher."""
+    setting = await execute_db(
+        "SELECT value FROM app_settings WHERE key = ?",
+        ["search_queue_reset_v1"]
+    )
+    if setting.rows:
+        return
+
+    stale_searchers = await execute_db("SELECT COUNT(*) FROM users WHERE status = 'searching'")
+    cleared_count = stale_searchers.rows[0][0] if stale_searchers.rows else 0
+
+    await execute_db(
+        "UPDATE users SET status = 'idle', partner_id = NULL, interest = NULL WHERE status = 'searching'"
+    )
+    await execute_db(
+        "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+        ["search_queue_reset_v1", "done"]
+    )
+
+    logging.info(f"One-time queue reset cleared {cleared_count} searching users.")
+
+
+async def run_matchmaking_pass():
+    """Pair waiting users in the background so the queue can move on its own."""
+    async with search_lock:
+        waiting_users = await execute_db(
+            "SELECT user_id, trust_tier FROM users WHERE status = 'searching' ORDER BY created_at, user_id"
+        )
+
+        waiting_by_tier = defaultdict(list)
+        for row in waiting_users.rows:
+            user_id, trust_tier = row[0], row[1]
+            if user_status_cache.get(user_id) == 'searching':
+                waiting_by_tier[trust_tier].append(user_id)
+
+        for queued_users in waiting_by_tier.values():
+            for index in range(0, len(queued_users) - 1, 2):
+                user_id = queued_users[index]
+                partner_id = queued_users[index + 1]
+                await connect_users(user_id, partner_id)
+
+
+async def background_matchmaker():
+    """Continuously try to pair queued users."""
+    while True:
+        await asyncio.sleep(MATCHMAKER_INTERVAL)
+        try:
+            await run_matchmaking_pass()
+        except Exception as e:
+            logging.warning(f"Background matchmaker error: {e}")
 
 
 # =============================================================================
@@ -234,25 +336,7 @@ async def cmd_search(message: types.Message):
 
         if partner_search.rows:
             partner_id = partner_search.rows[0][0]
-
-            # FIX #5: Batch DB operations — update both users atomically
-            await batch_db([
-                ("UPDATE users SET status = 'chatting', partner_id = ? WHERE user_id = ?", [partner_id, user_id]),
-                ("UPDATE users SET status = 'chatting', partner_id = ? WHERE user_id = ?", [user_id, partner_id]),
-            ])
-
-            # FIX #2: Update in-memory cache
-            cache_pair(user_id, partner_id)
-
-            await message.answer(
-                "🤝 <b>Partner found!</b> Say hi and drop your TikTok link.",
-                parse_mode="HTML"
-            )
-            await bot.send_message(
-                partner_id,
-                "🤝 <b>Partner found!</b> Say hi and drop your TikTok link.",
-                parse_mode="HTML"
-            )
+            await connect_users(user_id, partner_id)
         else:
             # No partner found — enter the queue
             await execute_db(
@@ -644,11 +728,14 @@ async def on_startup(**kwargs):
         # Initialize DB tables and load cache
         await init_db()
         logging.info("Database initialized successfully.")
+        await reset_search_queue_once()
+        logging.info("One-time search queue reset checked.")
         await load_cache_from_db()
         logging.info("Cache loaded from DB.")
 
-        # Start background idle-cleanup task
+        # Start background maintenance tasks
         asyncio.create_task(cleanup_idle_chats())
+        asyncio.create_task(background_matchmaker())
 
         # Set webhook
         webhook_url = f"{RENDER_APP_URL}{WEBHOOK_PATH}"
